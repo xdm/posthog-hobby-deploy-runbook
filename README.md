@@ -1,133 +1,205 @@
-# PostHog Hobby (Self-Hosted) — Deployment Runbook
+# PostHog Hobby — Agent Deployment Runbook
 
-Battle-tested notes for deploying the **PostHog hobby** stack (the free, single-server, Docker-Compose self-hosted build) on a fresh VPS — and, more importantly, for *keeping it alive*.
+Executable procedure for deploying the self-hosted **PostHog hobby** stack (Docker Compose, one host) and leaving it reboot-safe. Written for an AI coding agent with root SSH access; works the same for a human operator. Every step ends in a **PASS** check — do not proceed on FAIL, use the [failure table](#failure-table).
 
-Most public guides stop at "run the one-liner." This one is about everything that goes wrong *after* that: silent container deaths, out-of-memory thrashing, and a `latest`-image bug that quietly kills half the ingestion pipeline. The order of sections is the order you should work in.
+Derived from a production deployment (~500k events/day). Key facts the procedure encodes are listed in [Facts](#facts) so the agent can reason when reality diverges.
 
-> Scope: the **hobby** deployment (`bin/deploy-hobby`, Docker Compose on one host). Not the Kubernetes/enterprise install, and not PostHog Cloud.
+> Scope: `bin/deploy-hobby` only. Not Kubernetes (deprecated by PostHog), not PostHog Cloud. PostHog provides no support for self-hosted; verified against `latest`, July 2026.
+
+## Inputs
+
+```bash
+DOMAIN=analytics.example.com     # must already have an A record → server IP
+LE_EMAIL=ops@example.com         # Let's Encrypt notifications
+```
+
+Server requirements: **x86_64** (not ARM — ClickHouse issues), Ubuntu 24.04 LTS (26.04 OK), **≥16 GB RAM**, **≥4 vCPU**, **≥100 GB SSD**, root SSH. (12 GB is workable only via the optional low-RAM contingency in STEP 5; prefer resizing.)
+
+## Invariants — hold for the entire lifetime of the instance
+
+1. Never edit `docker-compose.yml` or `docker-compose.base.yml` — `upgrade-hobby` rewrites them. All customisation goes in `docker-compose.override.yml`.
+2. Never hand-rewrite `docker-compose.override.yml` wholesale. Either edit additively, or regenerate with the STEP 3 generator (it is deterministic and carries every fix). After any change: `docker compose config --quiet` must exit 0.
+3. After any state change, this must return **no rows** (the three listed names are one-shot jobs and may sit in `Exited`):
+
+```bash
+docker ps -a --format '{{.Names}}\t{{.Status}}' | grep 'Exited (0)' \
+  | grep -vE 'kafka-init|asyncmigration|temporal-admin'
+```
+
+4. Any change is complete only after the STEP 6 reboot test. Half of this stack's failure modes manifest only after a reboot.
 
 ---
 
-## TL;DR — the three things that cost the most time
+## STEP 0 — Preflight
 
-1. **Right-size the server up front.** 4 GB RAM does **not** run this stack reliably: it swaps, Redis times out, and the Node services silently die. Provision **16 GB RAM / 4+ vCPU** for production load (~500k events/day). 8 GB is test-only and tight.
-2. **PostHog's Node services exit with code 0 on failure** (they self-terminate gracefully after hitting a connection-error limit). Docker's default `on-failure` policy will **not** restart a container that exited 0 — so the service stays "silently dead" while the setup UI shows a red *Plugin server · Node*. Fix with `restart: always`.
-3. **The `latest` image has a bug:** the logs/traces ingestion consumers look for Redis on `127.0.0.1` because the hobby compose file doesn't set their host env vars. You must add them (see §3).
+```bash
+[ "$(uname -m)" = x86_64 ]                                  || echo "FAIL arch"
+[ "$(dig +short "$DOMAIN" | tail -1)" = "$(curl -s ifconfig.me)" ] || echo "FAIL dns"
+[ "$(free -g | awk '/Mem:/{print $2}')" -ge 11 ]            || echo "FAIL ram"
+[ "$(nproc)" -ge 4 ]                                        || echo "FAIL cpu"
+[ "$(df -BG --output=avail / | tail -1 | tr -dc 0-9)" -ge 80 ] || echo "FAIL disk"
+```
 
----
+**PASS:** no output. FAIL on dns → fix the A record first; Caddy needs it at first boot for the Let's Encrypt certificate. FAIL on anything else → resize before installing; 4 GB boxes enter an unrecoverable swap loop (see Facts F5).
 
-## 1. Before you install
+## STEP 1 — Swap (OOM insurance, not a RAM substitute)
 
-- **OS:** Ubuntu 24.04 LTS is the reference (all PostHog docs and scripts target it). 26.04 works too, but you'll be first to hit any doc drift. **x86_64 only, not ARM** — ClickHouse on ARM is historically problematic in this stack.
-- **Resources:** minimum **16 GB RAM / 4 vCPU / 100+ GB SSD** for production. Give the disk plenty of headroom — ClickHouse grows continuously with event volume.
-- **DNS first:** the domain's A record must resolve to the server IP **before** you install. The bundled Caddy proxy provisions TLS via Let's Encrypt for that domain on startup; no record → no certificate.
-- **Add swap** regardless of RAM size — cheap insurance against the OOM killer:
-  ```bash
+```bash
+if ! swapon --show | grep -q /swapfile; then
   fallocate -l 8G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
   echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  ```
-
-## 2. Install
-
-Official hobby installer (it will prompt for your domain and an email for Let's Encrypt):
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PostHog/posthog/HEAD/bin/deploy-hobby)"
+fi
+swapon --show
 ```
 
-What to expect:
-- **Migrations are slow on weak CPUs** — up to an hour on 2 vCPU. It's not hung, just wait. Much faster on 4+ vCPU.
-- **Ubuntu 26.04 note:** make sure Docker's apt repo actually serves packages for your release. Image pulls can be slow or flaky (Docker Hub); if a pull fails, loop it with retries until every image is present before continuing.
+**PASS:** `/swapfile` listed, 8G.
 
-## 3. Mandatory post-install fixes (without these it dies silently)
+## STEP 2 — Install
 
-Put **all** customisation in a separate **`docker-compose.override.yml`**, and do **not** edit the main `docker-compose.yml`. The `upgrade-hobby` script rewrites the main compose file on upgrade and your edits are lost; it never touches the override.
-
-Create `docker-compose.override.yml` next to the main compose file:
-
-```yaml
-services:
-  # --- fix for the latest-image bug: point logs/traces consumers at Redis ---
-  plugins:
-    restart: always
-    environment:
-      LOGS_REDIS_HOST: redis7
-      LOGS_REDIS_PORT: 6379
-      TRACES_REDIS_HOST: redis7
-      TRACES_REDIS_PORT: 6379
-  ingestion-logs:
-    restart: always
-    environment:
-      LOGS_REDIS_HOST: redis7
-      LOGS_REDIS_PORT: 6379
-      TRACES_REDIS_HOST: redis7
-      TRACES_REDIS_PORT: 6379
-  ingestion-traces:
-    restart: always
-    environment:
-      LOGS_REDIS_HOST: redis7
-      LOGS_REDIS_PORT: 6379
-      TRACES_REDIS_HOST: redis7
-      TRACES_REDIS_PORT: 6379
-
-  # --- restart: always for every other long-lived service ---
-  # web, worker, capture, recordings, proxy, clickhouse, kafka, zookeeper,
-  # db, redis7, objectstorage, seaweedfs, temporal, elasticsearch, cymbal, ...
-  # (skip the one-shot jobs: kafka-init, asyncmigrationscheck, temporal-admin-tools)
-  web: { restart: always }
-  worker: { restart: always }
-  # ...and so on for each service from `docker compose config --services`
+```bash
+cd /root
+DOMAIN=$DOMAIN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PostHog/posthog/HEAD/bin/deploy-hobby)"
 ```
 
-Quick way to generate the `restart: always` block for every service at once:
+Expected timings, not hangs: image pulls 5–20 min (Docker Hub is flaky — on a failed pull, loop `until docker compose pull; do sleep 5; done`, then re-run); Django migrations up to 60 min on weak CPUs (watch: `docker compose logs -f web`).
+
+**PASS:** `docker-compose.yml` exists in `/root`; `curl -s -o /dev/null -w '%{http_code}' https://$DOMAIN/_health` returns `200`.
+
+Do not stop here. A stock install violates Invariant 3 on every reboot (Facts F1–F3). STEP 3 is mandatory.
+
+## STEP 3 — Generate the override (mandatory)
+
+Write the generator once; STEP 5 reuses it with a parameter.
+
 ```bash
-docker compose config --services | grep -vE 'kafka-init|asyncmigration|temporal-admin' \
-  | awk 'BEGIN{print "services:"} {print "  "$1":\n    restart: always"}' \
-  > docker-compose.override.yml
-# then hand-add the `environment:` blocks for plugins/ingestion-logs/ingestion-traces (above)
+cd /root
+cat > /root/posthog-override-gen.py <<'EOF'
+import os, subprocess
+svcs = sorted(subprocess.run(
+    ["docker","compose","-f","docker-compose.yml","config","--services"],
+    capture_output=True, text=True, cwd="/root").stdout.split())
+assert len(svcs) > 25, "unexpected service list: %r" % svcs
+oneshot  = {"kafka-init", "asyncmigrationscheck", "temporal-admin-tools"}
+disable  = set(filter(None, os.environ.get("DISABLE","").split()))
+env = {  # F2: consumers default to Redis on 127.0.0.1 with TLS on; redis7 is plain TCP
+ "plugins":          [("LOGS_REDIS_HOST","redis7"),("LOGS_REDIS_PORT","6379"),
+                      ("TRACES_REDIS_HOST","redis7"),("TRACES_REDIS_PORT","6379"),
+                      ("LOGS_REDIS_TLS","false"),("TRACES_REDIS_TLS","false")],
+ "ingestion-logs":   [("LOGS_REDIS_HOST","redis7"),("LOGS_REDIS_PORT","6379"),
+                      ("LOGS_REDIS_TLS","false")],
+ "ingestion-traces": [("TRACES_REDIS_HOST","redis7"),("TRACES_REDIS_PORT","6379"),
+                      ("TRACES_REDIS_TLS","false")],
+ # F4: process counts default to core count; unpinned, more vCPUs = more RAM use
+ "web":              [("NGINX_UNIT_APP_PROCESSES","2")],
+ "worker":           [("WEB_CONCURRENCY","3")],
+}
+out = ["# GENERATED by posthog-override-gen.py - regenerate, do not hand-rewrite.",
+       "services:"]
+for s in svcs:
+    out.append("    %s:" % s)
+    if s in disable:
+        out.append("        profiles: [disabled]"); continue
+    if s not in oneshot:
+        out.append("        restart: always")   # F1: failure exits use code 0
+    if s in env:
+        out.append("        environment:")
+        for k, v in env[s]:
+            out.append("            %s: %s" % (k, v))
+open("docker-compose.override.yml","w").write("\n".join(out)+"\n")
+print("override written: %d services, %d disabled" % (len(svcs), len(disable)))
+EOF
+DISABLE="" python3 /root/posthog-override-gen.py
 docker compose config --quiet && docker compose up -d
 ```
 
-**Why `restart: always` and not `on-failure`:** when a Node service (plugins, ingestion-*) exhausts its Redis connection-error budget, it performs a graceful shutdown with **exit code 0**. To Docker that's a *successful* exit, so `on-failure` leaves it down. `always` brings it back every time, including after a reboot.
+Note: recreating `web` causes ~2 min of UI downtime while Django boots; transient 502s directly after are normal (F7). The `web`/`worker` pins throttle nothing feature-wise (F4) — on 32 GB+ boxes with heavy dashboard use you may raise them (e.g. 4/6).
 
-## 4. Diagnosing "service exited 0" (the signature failure of this stack)
+**PASS:** `config --quiet` silent; Invariant 3 clean after 3 minutes; `docker inspect root-plugins-1 --format '{{.HostConfig.RestartPolicy.Name}}'` prints `always`.
 
-If the setup UI shows a red *Plugin server · Node*, or a container is stuck in `Exited (0)`:
-
-```bash
-docker ps -a | grep -E 'plugins|ingestion'      # look for Exited (0)
-docker logs root-plugins-1 --tail 60            # what it logged before dying
-dmesg -T | grep -i 'oom\|killed process'        # did the OOM killer strike?
-free -h                                          # is swap maxed out?
-```
-
-Reading a Node service's death log:
-- `ECONNREFUSED` to `127.0.0.1:6379` → `LOGS_REDIS_HOST`/`TRACES_REDIS_HOST` not set → apply §3.
-- `ETIMEDOUT` to Redis + `"Enough of this, I quit!"` + `Shutting nodejs services down gracefully with SIGTERM` → Redis isn't responding in time. This is almost always **RAM pressure**: the stack is swapping and Redis stalls. Check `dmesg` for OOM and `free -h` — if swap is full and `available` is near zero, **add RAM**. There is no config workaround.
-
-Gotcha: container memory in `docker stats` can look modest precisely because most of it has been swapped to disk. Don't trust it — trust `free -h` and `dmesg`.
-
-## 5. Post-deploy verification
+## STEP 4 — Verify ingestion with numbers
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://DOMAIN/_health   # expect 200
-curl -s -o /dev/null -w '%{http_code}\n' https://DOMAIN/login     # 200
+curl -s -o /dev/null -w 'health %{http_code}\n' https://$DOMAIN/_health
+curl -s -o /dev/null -w 'login  %{http_code}\n' https://$DOMAIN/login
+API_KEY=<project_api_key>   # Settings → Project, or skip until a project exists
+curl -s -o /dev/null -w 'capture %{http_code} in %{time_total}s\n' \
+  -X POST https://$DOMAIN/capture/ -H 'Content-Type: application/json' \
+  -d "{\"api_key\":\"$API_KEY\",\"event\":\"runbook_check\",\"distinct_id\":\"runbook\"}"
 ```
-- Right after the `web` container is recreated you may see transient **502s** — Caddy cached the old container's IP. It clears itself within a minute or two; nothing to fix.
-- In the UI preflight, *Plugin server · Node* only turns green when `plugins` is alive and emitting a heartbeat — if it's crash-looping (§4), this stays red.
 
-## 6. Operating it
+**PASS:** health 200, login 200, capture 200 in **< 0.5 s** (healthy boxes: 0.03–0.06 s). Capture in whole seconds ⇒ memory pressure, see failure table row 4. Also confirm *Plugin server · Node* is green at `https://$DOMAIN/instance/status`.
 
-- **Disk:** watch `df -h /`. ClickHouse grows with event volume; plan for expansion or set a TTL on old data.
-- **Upgrades:** `upgrade-hobby` rewrites the main `docker-compose.yml`. Anything in `docker-compose.override.yml` survives — so keep every customisation there.
-- **After any reboot,** check `docker ps -a` for `Exited (0)`; with `restart: always` in place there should be none.
+## STEP 5 — OPTIONAL low-RAM contingency (skip on a properly-sized box)
+
+**The default deployment keeps every PostHog feature enabled — that is the intended end state.** Apply this step only when the box is stuck at ~12 GB and resizing is not an option: it frees memory by turning off subsystems you verifiably do not use. If you can add RAM instead, add RAM and skip to STEP 6.
+
+Decide from data, not assumption:
+
+| Subsystem | Unused if… | Services |
+|---|---|---|
+| Session replay | `docker logs root-proxy-1 --tail 5000 2>&1 \| grep -c '"/s/'` → 0 | `replay-capture ingestion-sessionreplay recording-api` |
+| Batch exports / data warehouse | no exports configured in UI | `temporal temporal-ui temporal-django-worker temporal-admin-tools elasticsearch` |
+| Error tracking | not using the Error tracking product | `cymbal` |
+
+`browserless` looks optional but is not: `worker` declares `depends_on` on it and compose refuses the config without it.
+
+```bash
+cd /root
+DISABLE="replay-capture ingestion-sessionreplay recording-api temporal temporal-ui temporal-django-worker temporal-admin-tools elasticsearch"
+DISABLE="$DISABLE" python3 /root/posthog-override-gen.py
+docker compose config --quiet && docker compose up -d
+docker compose stop $DISABLE
+
+# F6: old containers keep restart:always; a manually-stopped always-container
+# RESTARTS when dockerd restarts (= next reboot). Neutralize:
+for c in $(docker ps -aq --filter status=exited); do docker update --restart=no "$c"; done
+```
+
+**PASS:** Invariant 3 clean; for each disabled name, `docker inspect <container> --format '{{.HostConfig.RestartPolicy.Name}}'` prints `no`; re-run STEP 4 and get the same numbers.
+
+## STEP 6 — Reboot test (mandatory; the deployment is not done without it)
+
+```bash
+reboot
+# wait ~3 minutes, reconnect, then:
+docker ps -a --format '{{.Names}}\t{{.Status}}' | grep 'Exited (0)' \
+  | grep -vE 'kafka-init|asyncmigration|temporal-admin'    # must be empty
+# only if STEP 5 was applied:
+docker ps --format '{{.Names}}' | grep -E 'temporal|replay|recording|elasticsearch'  # must be empty
+# then re-run STEP 4 in full
+```
+
+**PASS:** all three checks clean. This is the gate that catches F1 (exit-0 deaths at boot), F6 (resurrection), and any override regression at once.
 
 ---
 
-## Notes
+## Failure table
 
-- **Multiple projects:** the *New project* button is disabled on the hobby build — multiple projects is a licensed feature, and self-hosted licenses are no longer sold (billing is cloud-only). The free, supported path is to create a separate **organization** per project (one project each).
-- PostHog explicitly does not provide support guarantees for self-hosted hobby instances. Treat this runbook as community knowledge, not official documentation.
+| # | Symptom (greppable) | Actual cause | Fix |
+|---|---|---|---|
+| 1 | Container `Exited (0)`, not restarting; UI: *Plugin server · Node — Error* | F1: error-budget suicide + `on-failure` policy ignores exit 0 | STEP 3; then `docker compose up -d` |
+| 2 | `ECONNREFUSED` `127.0.0.1:6379` in `docker logs root-plugins-1` | F2: `LOGS_REDIS_HOST`/`TRACES_REDIS_HOST` unset, default localhost | STEP 3 |
+| 3 | `ETIMEDOUT` on logs/traces Redis pools | F2: TLS-on default vs plain-TCP `redis7` | STEP 3 |
+| 4 | `Timed out ProduceRequest` ~20000 ms in capture logs; `all brokers DOWN`; capture POST takes seconds | F5: swap thrashing, not Kafka. Confirm: `vmstat 2 5` shows sustained nonzero `si` **and** `so`; `kswapd0` high in `top`; `dmesg -T \| grep -i oom` | More RAM, or STEP 5. Do **not** add swap — swap is the disease here |
+| 5 | 502 from domain right after recreating `web` | F7: Caddy marked upstream down while Django was booting | Wait 2 min; if it persists: `docker restart root-proxy-1` |
+| 6 | After reboot: infra (`db`, `redis7`, `kafka`) `Exited (0)`, everything else `Restarting` | Override lost/incomplete (Invariant 2 violated) | Re-run STEP 3, then STEP 6 |
+| 7 | After reboot: services disabled in STEP 5 are running again | F6: stopped containers kept `restart: always` | STEP 5 neutralize block |
+| 8 | `web`+`worker` RAM ballooned after adding vCPUs | F4: process counts follow core count | STEP 3 pins (`NGINX_UNIT_APP_PROCESSES`, `WEB_CONCURRENCY`) |
+| 9 | Migrations apparently stuck | Normal on ≤2 vCPU, up to 60 min | `docker compose logs -f web` and wait |
+
+## Facts
+
+- **F1** Node services (`plugins`, `ingestion-*`) self-terminate after ~10 consecutive Redis errors — log line `Enough of this, I quit!` — with **exit code 0**. Docker's `on-failure` treats 0 as success and never restarts them. Hence `restart: always` everywhere.
+- **F2** `latest` images: logs/traces consumers default to Redis `127.0.0.1` with TLS on; the hobby compose sets neither, and the bundled `redis7` is plain TCP. One failing consumer takes down the whole `plugins` process (it runs all consumer capabilities).
+- **F3** One-shot services that legitimately sit in `Exited`: `kafka-init`, `asyncmigrationscheck`, `temporal-admin-tools`.
+- **F4** `web` process count = `NGINX_UNIT_APP_PROCESSES` (~650 MB each), `worker` Celery concurrency = `WEB_CONCURRENCY`; both default from core count. Neither is on the ingestion path — pinning them low does not slow event capture.
+- **F5** Sizing observed: 4 GB = swap death loop (load 20+, 70–90% system CPU, 20 s Kafka timeouts, OOM kills) — untunable; 8 GB = idles, swaps under load; 12 GB = healthy with STEP 5; 16 GB = healthy without. `docker stats` under-reports swapped containers — judge by `free -h`, `vmstat`, `dmesg`.
+- **F6** `profiles: [disabled]` only stops compose from managing a service. Existing containers keep their creation-time restart policy, and a manually-stopped `restart: always` container restarts when the Docker daemon restarts — i.e. on reboot.
+- **F7** Caddy retains a dead-upstream verdict briefly; 502s right after `web` recreation self-heal in ≤2 min.
+- **F8** Kafka here is Redpanda in `--mode dev-container --smp 2` — a deliberately de-tuned profile. Irrelevant below ~1M events/day; revisit only past that.
+- **F9** Multi-project is license-gated on hobby (*New project* button disabled; self-hosted licenses no longer sold). Free path: one organization per project.
+- **F10** ClickHouse disk usage only grows; ~100 GB ≈ one year at 500k events/day. Check `df -h /` monthly, expand before 85%.
 
 ---
 
-*Contributions welcome — if you hit a failure mode not covered here, open a PR.*
+*MIT. PRs with new failure-table rows welcome.*
